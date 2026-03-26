@@ -60,7 +60,12 @@ def chat(request: ChatRequest, response: Response, db: Session = Depends(get_db)
 
 @router.post("/chat-stream")
 def chat_stream(request: ChatRequest, db: Session = Depends(get_db)):
-    """Endpoint for streaming chat responses."""
+
+    """
+    Endpoint for streaming chat responses using Server-Sent Events (SSE).
+    invokes the agent graph and streams the response back to the client as it is generated.
+    """
+    
     user = get_user(request.user_id, db)
     thread_id = resolve_thread(user.id, request.thread_id)
     config = make_config(user.id, thread_id)
