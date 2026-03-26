@@ -1,130 +1,135 @@
 """
-api_utils.py — Shared utilities for CheziousBot API endpoints.
+api_utils.py — Utility functions for API endpoints.
 """
 
 import json
 import logging
+import time
 
-from fastapi import HTTPException
-from langchain_core.messages import HumanMessage, AIMessage
+from fastapi import APIRouter,  HTTPException
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage
 from langgraph.types import Command
 from sqlmodel import Session
 
-from ..models.users_model import User
 from ..agent.graphs.graph import workflow
-from ..services.session_service import (
-    get_session_id,
-    resolve_session_id,
-    SessionError,
-)
+from ..models.users_model import User
+from ..services.session_service import get_session_id, resolve_session_id, SessionError
 
 logger = logging.getLogger(__name__)
+router = APIRouter()
 
-
-# ---------------------------------------------------------
-# User utilities
-# ---------------------------------------------------------
+CHUNK_SIZE = 5
+CHUNK_DELAY = 0.03
 
 def get_user(user_id: str, db: Session) -> User:
-    """Fetch user or raise 401."""
-
+    """Fetch user from DB or raise 404."""
     user = db.get(User, user_id)
-
     if not user:
-        raise HTTPException(status_code=401, detail="Unauthorized.")
-
+        raise HTTPException(status_code=404, detail="User not found.")
     return user
 
 
-# ---------------------------------------------------------
-# Session utilities
-# ---------------------------------------------------------
-
 def resolve_thread(user_id: str, thread_id: str | None) -> str:
-    """Resolve or create a conversation thread."""
-
+    """Resolve or create a thread ID for the user."""
     try:
-        if thread_id:
-            return resolve_session_id(thread_id, user_id)
-        return get_session_id(user_id)
+        return resolve_session_id(thread_id, user_id) if thread_id else get_session_id(user_id)
     except SessionError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
-# ---------------------------------------------------------
-# Graph helpers
-# ---------------------------------------------------------
-
-def _is_interrupted(state) -> bool:
-    """Return True if the graph is paused at an interrupt."""
-
-    return bool(
-        state.next
-        and state.tasks
-        and state.tasks[0].interrupts
-    )
+def make_config(user_id: str, thread_id: str) -> dict:
+    """Create a configuration dictionary for the graph."""
+    
+    return {"configurable": {"user_id": user_id, "thread_id": thread_id}}
 
 
-def build_graph_input(config: dict, message: str) -> Command | dict:
-    """
-    Build graph input.
-    Resumes from interrupt if paused, otherwise sends a new human message.
-    """
-
+def get_interrupt(config: dict) -> str | None:
+    
+    """Get current interrupt text from graph state, or None."""
     state = workflow.get_state(config)
+    if state.next and state.tasks and state.tasks[0].interrupts:
+        val = state.tasks[0].interrupts[0].value
+        return val.get("content", str(val)) if isinstance(val, dict) else str(val)
+    return None
 
-    if _is_interrupted(state):
-        return Command(resume=message)
 
-    return {"messages": [HumanMessage(content=message)]}
-
-
-def get_reply(config: dict) -> tuple[str, bool]:
-    """
-    Retrieve the final AI reply from graph state.
-
-    Returns:
-        (reply: str, interrupted: bool)
-    """
-
+def get_last_ai(config: dict) -> str | None:
+    """Get the last AI message from graph state."""
     state = workflow.get_state(config)
-
-    if _is_interrupted(state):
-        payload = state.tasks[0].interrupts[0].value
-        content = payload.get("content", str(payload)) if isinstance(payload, dict) else str(payload)
-        return content, True
-
     for msg in reversed(state.values.get("messages", [])):
         if isinstance(msg, AIMessage) and msg.content.strip():
-            return msg.content.strip(), False
+            return msg.content.strip()
+    return None
 
-    raise ValueError("Graph produced no AI response.")
 
+def build_input(config: dict, message: str):
+    """Return (graph_input, had_interrupt)."""
+    had_interrupt = get_interrupt(config) is not None
+    if had_interrupt:
+        return Command(resume=message), True
+    return {"messages": [HumanMessage(content=message)]}, False
 
-# ---------------------------------------------------------
-# SSE helpers
-# ---------------------------------------------------------
 
 def sse(event: str, data: dict) -> str:
-    """Format a single Server-Sent Event."""
-
+    """Format a Server-Sent Event string."""
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
-def stream_text(close_event: str, text: str, chunk_size: int = 3):
+def simulate_typing(text: str, final_event: str):
+    """Fake token-by-token for non-LLM text (interrupts, receipts)."""
+    for i in range(0, len(text), CHUNK_SIZE):
+        yield sse("token", {"content": text[i : i + CHUNK_SIZE]})
+        time.sleep(CHUNK_DELAY)
+    yield sse(final_event, {"content": ""})
+
+
+# ── Streaming ────────────────────────────────────────────────────────────────
+
+def stream_response(config: dict, message: str):
+    """Generator that yields SSE strings for streaming chat responses.
+        Handles both real LLM tokens and simulates tokens for interrupts or non-LLM messages.
+        
+        
+    Yields:        str: Formatted SSE string to send to the client.
+    
     """
-    Stream a plain text string token by token as SSE events.
+    try:
+        graph_input, _ = build_input(config, message)
+        existing_interrupt = get_interrupt(config)
+        non_chat_message = None
 
-    Yields "token" events for each chunk, then a final close_event
-    ("done" or "interrupt") with an empty content to signal end of stream.
+        for event_type, event_data in workflow.stream(graph_input, config=config, stream_mode=["messages", "updates"]):
 
-    Args:
-        close_event:  "done" | "interrupt" — the final event type.
-        text:         The full string to stream.
-        chunk_size:   Characters per token chunk (default: 3).
-    """
+            # Stream real LLM tokens (chat node only)
+            if event_type == "messages":
+                chunk, meta = event_data
+                
+                is_chat_node = meta.get("langgraph_node") == "chat"
+                is_llm_token = isinstance(chunk, AIMessageChunk) and chunk.content
+                if is_llm_token and is_chat_node:
+                    yield sse("token", {"content": chunk.content})
 
-    for i in range(0, len(text), chunk_size):
-        yield sse("token", {"content": text[i : i + chunk_size]})
+            # Capture messages from other nodes (receipts, cancellations, etc.)
+            elif event_type == "updates" and isinstance(event_data, dict):
+                for node_name, node_output in event_data.items():
+                    if node_name != "chat" and isinstance(node_output, dict):
+                        for msg in node_output.get("messages", []):
+                            if isinstance(msg, AIMessage) and msg.content:
+                                non_chat_message = msg.content
 
-    yield sse(close_event, {"content": ""})
+        # End the stream
+        new_interrupt = get_interrupt(config)
+        # check if there's a new interrupt that wasn't present at the start of streaming
+        is_new_interrupt = new_interrupt and new_interrupt != existing_interrupt
+        
+        if is_new_interrupt:
+            yield from simulate_typing(new_interrupt, "interrupt")  # graph paused, waiting for user
+        elif non_chat_message:
+            yield from simulate_typing(non_chat_message, "done")    # non-LLM node responded
+        else:
+            yield sse("done", {"content": ""})                       # normal LLM response ended
+
+    except Exception:
+        logger.exception("Streaming failed")
+        yield sse("error", {"detail": "Something went wrong. Please try again."})
+        
