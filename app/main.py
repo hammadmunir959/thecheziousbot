@@ -1,4 +1,5 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Session
 from .database.db import get_db, init_db
 from .models import User
@@ -6,20 +7,31 @@ from .api.v1.router import api_router
 from .api.v1.security import get_api_key
 from contextlib import asynccontextmanager
 import time
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("Initializing database...")
+    logger.info("Starting up CheziousBot API...")
     init_db()
     yield
-    print("Cleanup complete.")
+    logger.info("Shutting down CheziousBot API...")
 
 
 app = FastAPI(
-    title="Chezious Pizza Bot",
+    title="CheziousBot API",
+    version="1.0.0",
     description="API for handling pizza orders via bot",
     lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -35,10 +47,16 @@ async def add_process_time_header(request, call_next):
 @app.get("/")
 def root():
     return {
-        "message": "Chezious Pizza Bot is live",
+        "message": "Welcome to the CheziousBot API",
+        "version": "1.0.0",
+        "status": "running",
         "docs": "/docs",
-        "health": "/ping"
     }
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy"}
 
 
 @app.get("/ping")
